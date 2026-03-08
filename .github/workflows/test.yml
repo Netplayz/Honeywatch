@@ -1,0 +1,45 @@
+name: Test
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt flake8
+
+      - name: Syntax check
+        run: |
+          python -c "
+          import ast, sys
+          files = ['main.py', 'app.py', 'services.py', 'database.py']
+          ok = True
+          for f in files:
+              try:
+                  ast.parse(open(f).read())
+                  print(f'  ✔ {f}')
+              except SyntaxError as e:
+                  print(f'  ✘ {f}: {e}')
+                  ok = False
+          sys.exit(0 if ok else 1)
+          "
+
+      - name: Lint
+        run: |
+          flake8 main.py app.py services.py database.py \
+            --max-line-length=100 \
+            --ignore=E501,W503,E402

@@ -77,12 +77,12 @@ _original_log_event = database.log_event
 
 
 def _patched_log_event(src_ip, src_port, service, event_type,
-                        payload, username, password):
+                       payload, username, password):
     _original_log_event(src_ip, src_port, service, event_type,
-                        payload, username, password)
+                       payload, username, password)
     _broadcast({
-        "src_ip":     src_ip,
-        "service":    service,
+        "src_ip": src_ip,
+        "service": service,
         "event_type": event_type,
     })
 
@@ -139,7 +139,7 @@ def api_stream():
         generate(),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control":    "no-cache",
+            "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )

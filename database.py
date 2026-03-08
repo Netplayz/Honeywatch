@@ -100,11 +100,11 @@ def _geo_lookup(ip: str) -> dict:
             data = resp.json()
             if data.get("status") == "success":
                 result = {
-                    "country":   data.get("country"),
-                    "city":      data.get("city"),
-                    "latitude":  data.get("lat"),
+                    "country": data.get("country"),
+                    "city": data.get("city"),
+                    "latitude": data.get("lat"),
                     "longitude": data.get("lon"),
-                    "isp":       data.get("org") or data.get("isp"),
+                    "isp": data.get("org") or data.get("isp"),
                 }
     except Exception as exc:
         logger.debug("Geo lookup failed for %s: %s", ip, exc)
@@ -143,7 +143,7 @@ def _threat_lookup(ip: str) -> dict:
                 tags += f",type={usage}"
             result = {
                 "is_known_bad": 1 if score >= 25 else 0,
-                "threat_tags":  tags,
+                "threat_tags": tags,
             }
     except Exception as exc:
         logger.debug("Threat lookup failed for %s: %s", ip, exc)
@@ -171,9 +171,9 @@ def log_event(
     timestamp = datetime.now(timezone.utc).isoformat()
 
     def _insert():
-        geo    = _geo_lookup(src_ip)
+        geo = _geo_lookup(src_ip)
         threat = _threat_lookup(src_ip)
-        conn   = _get_conn()
+        conn = _get_conn()
         conn.execute(
             """
             INSERT INTO events (
@@ -219,11 +219,11 @@ def get_stats() -> dict:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     return {
-        "total":      scalar("SELECT COUNT(*) FROM events"),
-        "last_hour":  scalar(
+        "total": scalar("SELECT COUNT(*) FROM events"),
+        "last_hour": scalar(
             "SELECT COUNT(*) FROM events WHERE timestamp >= datetime('now','-1 hour')"
         ),
-        "last_24h":   scalar(
+        "last_24h": scalar(
             "SELECT COUNT(*) FROM events WHERE timestamp >= datetime('now','-24 hours')"
         ),
         "known_bad_count": scalar(

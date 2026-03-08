@@ -3,13 +3,10 @@ HoneyWatch - Honeypot services
 SSH, HTTP, Telnet and FTP traps that log every connection attempt.
 """
 
-import asyncio
 import logging
-import os
 import re
 import socket
 import threading
-from pathlib import Path
 
 import asyncssh
 
@@ -130,8 +127,8 @@ class HTTPHoneypot(_BaseHoneypot):
             # Parse request line
             first_line = raw.split("\r\n", 1)[0]
             parts = first_line.split(" ")
-            method  = parts[0] if len(parts) > 0 else ""
-            path    = parts[1] if len(parts) > 1 else "/"
+            method = parts[0] if len(parts) > 0 else ""
+            path = parts[1] if len(parts) > 1 else "/"
             # Parse POST body for credentials
             body = raw.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in raw else ""
             username = password = None

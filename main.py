@@ -49,9 +49,9 @@ async def main():
 
     # Start thread-based honeypots
     thread_services = [
-        (HTTPHoneypot,   int(os.environ.get("HTTP_PORT",   "8080"))),
+        (HTTPHoneypot, int(os.environ.get("HTTP_PORT", "8080"))),
         (TelnetHoneypot, int(os.environ.get("TELNET_PORT", "2323"))),
-        (FTPHoneypot,    int(os.environ.get("FTP_PORT",    "2121"))),
+        (FTPHoneypot, int(os.environ.get("FTP_PORT", "2121"))),
     ]
     for cls, port in thread_services:
         cls(port=port).start()

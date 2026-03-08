@@ -39,7 +39,7 @@ A lightweight, production-ready honeypot for **Ubuntu 24.04 LTS** on DigitalOcea
 SSH into your droplet as root, then:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/honeywatch.git
+git clone https://github.com/netplayz/honeywatch.git
 cd honeywatch
 sudo bash install.sh
 ```

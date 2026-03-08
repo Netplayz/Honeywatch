@@ -1,0 +1,27 @@
+[Unit]
+Description=HoneyWatch Honeypot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=honeypot
+Group=honeypot
+WorkingDirectory=/opt/honeywatch
+ExecStart=/opt/honeywatch/venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment (edit or use /etc/honeywatch/env)
+EnvironmentFile=-/etc/honeywatch/env
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/honeypot /var/log/honeypot
+
+[Install]
+WantedBy=multi-user.target

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncssh
-from database import log_event
+from honeypot.database import log_event
 
 logger = logging.getLogger(__name__)
 

@@ -14,9 +14,11 @@ import sys
 from flask import Flask, render_template, jsonify, Response, request, abort
 from pathlib import Path
 
-# Add parent to path so we can import database
-sys.path.insert(0, str(Path(__file__).parent.parent / "honeypot"))
-import database as db
+# Add project root to path so honeypot package is importable
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from honeypot import database as db
 
 logger = logging.getLogger(__name__)
 

@@ -8,6 +8,7 @@ Type=simple
 User=honeypot
 Group=honeypot
 WorkingDirectory=/opt/honeywatch
+Environment=PYTHONPATH=/opt/honeywatch
 ExecStart=/opt/honeywatch/venv/bin/python main.py
 Restart=on-failure
 RestartSec=10

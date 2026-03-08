@@ -25,9 +25,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("honeypot.main")
 
-# Add local paths
-sys.path.insert(0, str(Path(__file__).parent / "honeypot"))
-sys.path.insert(0, str(Path(__file__).parent / "dashboard"))
+# Ensure the project root is on sys.path so subpackages resolve correctly
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from honeypot.services import HTTPHoneypot, TelnetHoneypot, FTPHoneypot, start_ssh_honeypot
 

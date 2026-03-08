@@ -1,147 +1,151 @@
 """
-Web dashboard — Flask app served on port 5000.
-Real-time updates via SSE; world map via Leaflet.js.
+HoneyWatch - Web dashboard
+Flask app with Server-Sent Events for real-time updates.
+Served on port 5000 by default.
 """
 
 import json
-import time
-import queue
-import threading
 import logging
 import os
+import queue
 import sys
-
-from flask import Flask, render_template, jsonify, Response, request, abort
+import threading
 from pathlib import Path
+from functools import wraps
 
-# Add project root to path so honeypot package is importable
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-from honeypot import database as db
+from flask import Flask, Response, jsonify, request
+
+# Ensure the project root is on sys.path so database.py is importable
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import database
 
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("DASHBOARD_SECRET", "change-me-in-production")
+app.secret_key = os.environ.get("DASHBOARD_SECRET", "honeywatch-change-me")
 
-# ─── Optional basic auth ───────────────────────────────────────────────────────
+# ── Optional HTTP basic auth ───────────────────────────────────────────────────
 
-DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "")
-DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
-
-
-def _check_auth(username, password):
-    return username == DASHBOARD_USER and password == DASHBOARD_PASS
+_DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "")
+_DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
 
 
-def _requires_auth(f):
-    from functools import wraps
-    from flask import request, Response
-
+def _auth_required(f):
     @wraps(f)
-    def decorated(*args, **kwargs):
-        if not DASHBOARD_USER:  # Auth disabled if no user set
+    def wrapper(*args, **kwargs):
+        if not _DASHBOARD_USER:
             return f(*args, **kwargs)
         auth = request.authorization
-        if not auth or not _check_auth(auth.username, auth.password):
+        if (
+            not auth
+            or auth.username != _DASHBOARD_USER
+            or auth.password != _DASHBOARD_PASS
+        ):
             return Response(
                 "Authentication required.",
                 401,
-                {"WWW-Authenticate": 'Basic realm="Honeypot Dashboard"'},
+                {"WWW-Authenticate": 'Basic realm="HoneyWatch"'},
             )
         return f(*args, **kwargs)
+    return wrapper
 
-    return decorated
 
+# ── Server-Sent Events broadcaster ────────────────────────────────────────────
 
-# ─── SSE event broadcaster ─────────────────────────────────────────────────────
-
-_sse_clients: list[queue.Queue] = []
+_sse_clients: list = []
 _sse_lock = threading.Lock()
 
 
-def broadcast_event(event_data: dict):
-    msg = f"data: {json.dumps(event_data)}\n\n"
+def _broadcast(data: dict):
+    message = "data: " + json.dumps(data) + "\n\n"
     with _sse_lock:
-        dead = []
+        stale = []
         for q in _sse_clients:
             try:
-                q.put_nowait(msg)
+                q.put_nowait(message)
             except queue.Full:
-                dead.append(q)
-        for q in dead:
+                stale.append(q)
+        for q in stale:
             _sse_clients.remove(q)
 
 
-# Patch database to also broadcast
-_orig_log_event = db.log_event
+# Patch database.log_event so new events are pushed to SSE clients live
+_original_log_event = database.log_event
 
 
-def _patched_log_event(*args, **kwargs):
-    _orig_log_event(*args, **kwargs)
-    # Broadcast lightweight summary
-    payload = {
-        "src_ip": kwargs.get("src_ip") or (args[0] if args else ""),
-        "service": kwargs.get("service") or (args[2] if len(args) > 2 else ""),
-        "event_type": kwargs.get("event_type") or (args[3] if len(args) > 3 else ""),
-        "ts": time.time(),
-    }
-    broadcast_event(payload)
+def _patched_log_event(src_ip, src_port, service, event_type,
+                        payload, username, password):
+    _original_log_event(src_ip, src_port, service, event_type,
+                        payload, username, password)
+    _broadcast({
+        "src_ip":     src_ip,
+        "service":    service,
+        "event_type": event_type,
+    })
 
 
-db.log_event = _patched_log_event
+database.log_event = _patched_log_event
 
 
-# ─── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.route("/")
-@_requires_auth
+@_auth_required
 def index():
-    return render_template("index.html")
+    html_path = Path(__file__).resolve().parent / "index.html"
+    return html_path.read_text(encoding="utf-8")
 
 
 @app.route("/api/stats")
-@_requires_auth
+@_auth_required
 def api_stats():
-    return jsonify(db.get_stats())
+    return jsonify(database.get_stats())
 
 
 @app.route("/api/events")
-@_requires_auth
+@_auth_required
 def api_events():
     limit = min(int(request.args.get("limit", 100)), 1000)
-    return jsonify(db.get_recent_events(limit))
+    return jsonify(database.get_recent_events(limit))
 
 
 @app.route("/api/stream")
-@_requires_auth
+@_auth_required
 def api_stream():
-    """Server-Sent Events endpoint for live updates."""
-    q: queue.Queue = queue.Queue(maxsize=50)
+    """Server-Sent Events endpoint — pushes live events to the browser."""
+    client_q: queue.Queue = queue.Queue(maxsize=100)
     with _sse_lock:
-        _sse_clients.append(q)
+        _sse_clients.append(client_q)
 
     def generate():
         try:
             yield "retry: 3000\n\n"
             while True:
                 try:
-                    msg = q.get(timeout=30)
-                    yield msg
+                    yield client_q.get(timeout=25)
                 except queue.Empty:
                     yield ": keepalive\n\n"
         except GeneratorExit:
+            pass
+        finally:
             with _sse_lock:
-                if q in _sse_clients:
-                    _sse_clients.remove(q)
+                if client_q in _sse_clients:
+                    _sse_clients.remove(client_q)
 
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache",
-                             "X-Accel-Buffering": "no"})
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("DASHBOARD_PORT", 5000))
     host = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
+    port = int(os.environ.get("DASHBOARD_PORT", "5000"))
     app.run(host=host, port=port, threaded=True, debug=False)

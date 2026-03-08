@@ -1,306 +1,219 @@
 """
-Honeypot Services: SSH, HTTP, FTP, Telnet traps
-Logs all connection attempts with metadata
+HoneyWatch - Honeypot services
+SSH, HTTP, Telnet and FTP traps that log every connection attempt.
 """
 
 import asyncio
-import socket
-import threading
 import logging
-import json
-import time
 import os
 import re
-from datetime import datetime, timezone
+import socket
+import threading
 from pathlib import Path
 
 import asyncssh
-from honeypot.database import log_event
+
+# database is in the same directory; main.py puts ROOT on sys.path
+import database
 
 logger = logging.getLogger(__name__)
 
-# ─── SSH Honeypot ────────────────────────────────────────────────────────────
 
-class FakeSSHServer(asyncssh.SSHServer):
-    def __init__(self, client_addr):
-        self._client_addr = client_addr
+# ── SSH honeypot ───────────────────────────────────────────────────────────────
 
-    def connection_made(self, conn):
-        self._conn = conn
-        ip, port = self._client_addr
-        log_event(
-            src_ip=ip,
-            src_port=port,
-            service="SSH",
-            event_type="connection",
-            payload=None,
-            username=None,
-            password=None
-        )
-        logger.info(f"SSH connection from {ip}:{port}")
+async def start_ssh_honeypot(host: str = "0.0.0.0", port: int = 2222):
+    """Start a fake SSH server that logs every auth attempt."""
 
-    def begin_auth(self, username):
-        self._username = username
-        return True  # Always require auth
+    host_key = asyncssh.generate_private_key("ssh-rsa")
 
-    def password_auth_requested(self):
-        return True
-
-    def validate_password(self, username, password):
-        ip, port = self._client_addr
-        log_event(
-            src_ip=ip,
-            src_port=port,
-            service="SSH",
-            event_type="auth_attempt",
-            payload=None,
-            username=username,
-            password=password
-        )
-        logger.info(f"SSH auth attempt {ip} user={username} pass={password}")
-        return False  # Always reject
-
-    def public_key_auth_requested(self):
-        return False
-
-
-async def start_ssh_honeypot(host="0.0.0.0", port=2222):
-    """Start the SSH honeypot on the given port."""
-    key = asyncssh.generate_private_key("ssh-rsa")
-
-    async def create_server():
-        return FakeSSHServer((None, None))
-
-    # We need the peer address — use a wrapper
-    async def handle_client(process):
-        pass
-
-    class TrackedSSHServer(asyncssh.SSHServer):
+    class _Server(asyncssh.SSHServer):
         def connection_made(self, conn):
             self._conn = conn
-            peer = conn.get_extra_info("peername")
-            ip = peer[0] if peer else "unknown"
-            port_r = peer[1] if peer else 0
-            self._peer_ip = ip
-            self._peer_port = port_r
-            log_event(src_ip=ip, src_port=port_r, service="SSH",
-                      event_type="connection", payload=None,
-                      username=None, password=None)
+            peer = conn.get_extra_info("peername") or ("unknown", 0)
+            self._ip, self._port = peer[0], peer[1]
+            database.log_event(
+                src_ip=self._ip, src_port=self._port,
+                service="SSH", event_type="connection",
+                payload=None, username=None, password=None,
+            )
+            logger.info("SSH connection from %s:%s", self._ip, self._port)
 
         def begin_auth(self, username):
             self._username = username
-            return True
+            return True  # always require authentication
 
         def password_auth_requested(self):
             return True
 
         def validate_password(self, username, password):
-            log_event(src_ip=self._peer_ip, src_port=self._peer_port,
-                      service="SSH", event_type="auth_attempt",
-                      payload=None, username=username, password=password)
-            return False
+            database.log_event(
+                src_ip=self._ip, src_port=self._port,
+                service="SSH", event_type="auth_attempt",
+                payload=None, username=username, password=password,
+            )
+            logger.info("SSH auth from %s  user=%s  pass=%s",
+                        self._ip, username, password)
+            return False  # always deny
 
         def public_key_auth_requested(self):
             return False
 
+    async def _noop(process):
+        pass
+
     await asyncssh.create_server(
-        TrackedSSHServer,
+        _Server,
         host=host,
         port=port,
-        server_host_keys=[key],
-        process_factory=handle_client,
+        server_host_keys=[host_key],
+        process_factory=_noop,
     )
-    logger.info(f"SSH honeypot listening on {host}:{port}")
+    logger.info("SSH honeypot listening on %s:%s", host, port)
 
 
-# ─── HTTP Honeypot ────────────────────────────────────────────────────────────
+# ── Base class for thread-based honeypots ──────────────────────────────────────
 
-class HTTPHoneypot(threading.Thread):
-    """Fake HTTP server that logs all requests."""
+class _BaseHoneypot(threading.Thread):
+    SERVICE = "unknown"
+    DEFAULT_PORT = 9999
 
-    BANNER = b"""\
-HTTP/1.1 200 OK\r
-Server: Apache/2.4.41 (Ubuntu)\r
-Content-Type: text/html\r
-Connection: close\r
-\r
-<!DOCTYPE html>
-<html><head><title>Login</title></head>
-<body>
-<h2>Admin Panel</h2>
-<form method="POST" action="/login">
-  <input name="username" placeholder="Username"><br>
-  <input name="password" type="password" placeholder="Password"><br>
-  <button type="submit">Login</button>
-</form>
-</body></html>
-"""
-
-    def __init__(self, host="0.0.0.0", port=8080):
+    def __init__(self, host: str = "0.0.0.0", port: int = None):
         super().__init__(daemon=True)
         self.host = host
-        self.port = port
+        self.port = port if port is not None else self.DEFAULT_PORT
 
     def run(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((self.host, self.port))
             srv.listen(50)
-            logger.info(f"HTTP honeypot listening on {self.host}:{self.port}")
+            logger.info("%s honeypot listening on %s:%s",
+                        self.SERVICE, self.host, self.port)
             while True:
                 try:
                     conn, addr = srv.accept()
-                    t = threading.Thread(
+                    threading.Thread(
                         target=self._handle, args=(conn, addr), daemon=True
-                    )
-                    t.start()
-                except Exception as e:
-                    logger.error(f"HTTP accept error: {e}")
+                    ).start()
+                except Exception as exc:
+                    logger.error("%s accept error: %s", self.SERVICE, exc)
 
-    def _handle(self, conn, addr):
+    def _handle(self, conn: socket.socket, addr: tuple):
+        raise NotImplementedError
+
+
+# ── HTTP honeypot ──────────────────────────────────────────────────────────────
+
+class HTTPHoneypot(_BaseHoneypot):
+    SERVICE = "HTTP"
+    DEFAULT_PORT = 8080
+
+    _RESPONSE = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Server: Apache/2.4.41 (Ubuntu)\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"<!DOCTYPE html><html><head><title>Admin Login</title></head>"
+        b"<body><h2>Admin Panel</h2>"
+        b"<form method='POST' action='/login'>"
+        b"<label>Username <input name='username'></label><br>"
+        b"<label>Password <input name='password' type='password'></label><br>"
+        b"<button type='submit'>Login</button>"
+        b"</form></body></html>"
+    )
+
+    def _handle(self, conn: socket.socket, addr: tuple):
         ip, port = addr
         try:
-            data = conn.recv(4096).decode(errors="replace")
-            # Parse method, path, headers
-            lines = data.split("\r\n")
-            first = lines[0] if lines else ""
-            parts = first.split(" ")
-            method = parts[0] if len(parts) > 0 else ""
-            path = parts[1] if len(parts) > 1 else "/"
-
-            # Extract POST body (credentials)
-            body = ""
-            if "\r\n\r\n" in data:
-                body = data.split("\r\n\r\n", 1)[1]
-
-            username = None
-            password = None
+            raw = conn.recv(4096).decode(errors="replace")
+            # Parse request line
+            first_line = raw.split("\r\n", 1)[0]
+            parts = first_line.split(" ")
+            method  = parts[0] if len(parts) > 0 else ""
+            path    = parts[1] if len(parts) > 1 else "/"
+            # Parse POST body for credentials
+            body = raw.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in raw else ""
+            username = password = None
             if body:
-                m = re.search(r"username=([^&]*)", body)
+                m = re.search(r"(?:^|&)username=([^&]*)", body)
                 if m:
                     username = m.group(1)
-                m = re.search(r"password=([^&]*)", body)
+                m = re.search(r"(?:^|&)password=([^&]*)", body)
                 if m:
                     password = m.group(1)
-
-            log_event(
-                src_ip=ip,
-                src_port=port,
-                service="HTTP",
-                event_type="request",
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="HTTP", event_type="request",
                 payload=f"{method} {path}",
-                username=username,
-                password=password,
+                username=username, password=password,
             )
-            conn.sendall(self.BANNER)
-        except Exception as e:
-            logger.error(f"HTTP handler error: {e}")
+            conn.sendall(self._RESPONSE)
+        except Exception as exc:
+            logger.debug("HTTP handler error from %s: %s", ip, exc)
         finally:
             conn.close()
 
 
-# ─── Telnet Honeypot ──────────────────────────────────────────────────────────
+# ── Telnet honeypot ────────────────────────────────────────────────────────────
 
-class TelnetHoneypot(threading.Thread):
-    BANNER = b"Ubuntu 24.04 LTS\r\nlogin: "
+class TelnetHoneypot(_BaseHoneypot):
+    SERVICE = "Telnet"
+    DEFAULT_PORT = 2323
 
-    def __init__(self, host="0.0.0.0", port=2323):
-        super().__init__(daemon=True)
-        self.host = host
-        self.port = port
-
-    def run(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind((self.host, self.port))
-            srv.listen(50)
-            logger.info(f"Telnet honeypot listening on {self.host}:{self.port}")
-            while True:
-                try:
-                    conn, addr = srv.accept()
-                    t = threading.Thread(
-                        target=self._handle, args=(conn, addr), daemon=True
-                    )
-                    t.start()
-                except Exception as e:
-                    logger.error(f"Telnet accept error: {e}")
-
-    def _handle(self, conn, addr):
+    def _handle(self, conn: socket.socket, addr: tuple):
         ip, port = addr
         try:
-            conn.sendall(self.BANNER)
+            conn.sendall(b"Ubuntu 24.04 LTS\r\nlogin: ")
             username = conn.recv(256).decode(errors="replace").strip()
             conn.sendall(b"Password: ")
             password = conn.recv(256).decode(errors="replace").strip()
-            log_event(
-                src_ip=ip,
-                src_port=port,
-                service="Telnet",
-                event_type="auth_attempt",
-                payload=None,
-                username=username,
-                password=password,
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="Telnet", event_type="auth_attempt",
+                payload=None, username=username, password=password,
             )
             conn.sendall(b"\r\nLogin incorrect\r\n")
-        except Exception as e:
-            logger.error(f"Telnet handler error: {e}")
+        except Exception as exc:
+            logger.debug("Telnet handler error from %s: %s", ip, exc)
         finally:
             conn.close()
 
 
-# ─── FTP Honeypot ─────────────────────────────────────────────────────────────
+# ── FTP honeypot ───────────────────────────────────────────────────────────────
 
-class FTPHoneypot(threading.Thread):
-    def __init__(self, host="0.0.0.0", port=2121):
-        super().__init__(daemon=True)
-        self.host = host
-        self.port = port
+class FTPHoneypot(_BaseHoneypot):
+    SERVICE = "FTP"
+    DEFAULT_PORT = 2121
 
-    def run(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind((self.host, self.port))
-            srv.listen(50)
-            logger.info(f"FTP honeypot listening on {self.host}:{self.port}")
-            while True:
-                try:
-                    conn, addr = srv.accept()
-                    t = threading.Thread(
-                        target=self._handle, args=(conn, addr), daemon=True
-                    )
-                    t.start()
-                except Exception as e:
-                    logger.error(f"FTP accept error: {e}")
-
-    def _handle(self, conn, addr):
+    def _handle(self, conn: socket.socket, addr: tuple):
         ip, port = addr
+        username = None
         try:
             conn.sendall(b"220 ProFTPD 1.3.6 Server ready.\r\n")
-            username = None
-            password = None
-            for _ in range(10):
-                data = conn.recv(256).decode(errors="replace").strip()
-                if not data:
+            for _ in range(20):
+                line = conn.recv(256).decode(errors="replace").strip()
+                if not line:
                     break
-                if data.upper().startswith("USER "):
-                    username = data[5:]
+                upper = line.upper()
+                if upper.startswith("USER "):
+                    username = line[5:].strip()
                     conn.sendall(b"331 Password required.\r\n")
-                elif data.upper().startswith("PASS "):
-                    password = data[5:]
-                    log_event(
-                        src_ip=ip,
-                        src_port=port,
-                        service="FTP",
-                        event_type="auth_attempt",
-                        payload=None,
-                        username=username,
-                        password=password,
+                elif upper.startswith("PASS "):
+                    password = line[5:].strip()
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="FTP", event_type="auth_attempt",
+                        payload=None, username=username, password=password,
                     )
                     conn.sendall(b"530 Login incorrect.\r\n")
                     break
-                elif data.upper() == "QUIT":
+                elif upper == "QUIT":
+                    conn.sendall(b"221 Goodbye.\r\n")
                     break
-        except Exception as e:
-            logger.error(f"FTP handler error: {e}")
+                else:
+                    conn.sendall(b"500 Unknown command.\r\n")
+        except Exception as exc:
+            logger.debug("FTP handler error from %s: %s", ip, exc)
         finally:
             conn.close()

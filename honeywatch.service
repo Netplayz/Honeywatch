@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=honeypot
-Group=honeypot
+User=honeywatch
+Group=honeywatch
 WorkingDirectory=/opt/honeywatch
 Environment=PYTHONPATH=/opt/honeywatch
 ExecStart=/opt/honeywatch/venv/bin/python main.py
@@ -15,13 +15,22 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# Environment (edit or use /etc/honeywatch/env)
+# Config file written by install.sh
 EnvironmentFile=-/etc/honeywatch/env
 
-# Hardening
+# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ProtectHome=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictNamespaces=true
+RestrictRealtime=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
 ReadWritePaths=/var/lib/honeypot /var/log/honeypot
 
 [Install]

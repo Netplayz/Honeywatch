@@ -1,14 +1,9 @@
 __pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-dist/
-build/
+*.pyc
+*.pyo
 venv/
 .venv/
 *.db
 *.log
 .env
-/etc/
-*.pyc
 .DS_Store

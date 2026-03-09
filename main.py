@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import threading
+import signal
 from pathlib import Path
 
 # Always resolve imports relative to this file's directory
@@ -47,6 +48,7 @@ def start_dashboard():
     host = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
     port = int(os.environ.get("DASHBOARD_PORT", "5000"))
     logger.info("Dashboard starting on %s:%s", host, port)
+    # use_reloader=False is critical when running in a thread
     app.run(host=host, port=port, threaded=True, debug=False, use_reloader=False)
 
 
@@ -55,7 +57,7 @@ async def main():
     logger.info("  HoneyWatch starting up")
     logger.info("=" * 50)
 
-    # Start thread-based honeypots
+    # 1. Start thread-based honeypots
     thread_services = [
         (HTTPHoneypot, int(os.environ.get("HTTP_PORT", "8080"))),
         (TelnetHoneypot, int(os.environ.get("TELNET_PORT", "2323"))),
@@ -69,20 +71,38 @@ async def main():
 
     for cls, port in thread_services:
         logger.info("Starting %s on port %s", cls.__name__, port)
-        cls(port=port).start()
+        try:
+            cls(port=port).start()
+        except Exception as e:
+            logger.error("Failed to start %s on port %s: %s", cls.__name__, port, e)
 
-    # Start dashboard in its own thread
+    # 2. Start dashboard in its own thread
     threading.Thread(target=start_dashboard, daemon=True).start()
 
-    # Start async SSH honeypot
+    # 3. Start async SSH honeypot
     ssh_port = int(os.environ.get("SSH_PORT", "2222"))
+    await start_ssh_honeypot(port=ssh_port)
+
     logger.info("All services running. Press Ctrl+C to stop.")
 
-    await start_ssh_honeypot(port=ssh_port)
+    # 4. KEEP ALIVE 
+    # This prevents the script from exiting and shutting down the service.
+    # We use an Event to wait until the process is interrupted.
+    stop_event = asyncio.Event()
+
+    # Define a clean shutdown for signals (SIGTERM/SIGINT)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_event.set)
+
+    # The script stays here until a signal is received
+    await stop_event.wait()
+    logger.info("Shutdown signal received. Closing HoneyWatch.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Shutdown signal received. Closing HoneyWatch.")
+    except Exception as e:
+        logger.critical("HoneyWatch crashed with a fatal error: %s", e)
+        sys.exit(1)

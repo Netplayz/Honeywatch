@@ -367,27 +367,28 @@ class MySQLHoneypot(_BaseHoneypot):
     DEFAULT_PORT = 3306
 
     # Hand-crafted MySQL Initial Handshake Packet (protocol v10)
+    # Fields: TPKT header | proto=10 | version string | conn-id | auth-data-1
+    #         | capability-low | charset | status | capability-high | auth-data-len
+    #         | reserved(10) | auth-data-2 | plugin name
     _GREETING = (
-        b"\x4a\x00\x00\x00"          # packet length = 74, seq = 0
-        b"\x0a"                       # protocol version 10
-        b"5.7.38-log\x00"            # server version string
-        b"\x01\x00\x00\x00"          # connection id = 1
-        b"\x3e\x4b\x7c\x21\x32\x5f\x62\x41\x00"  # auth-plugin-data part 1 (8 bytes + NUL)
-        b"\xff\xf7"                   # capability flags low
-        b"\x21"                       # charset utf8
-        b"\x02\x00"                   # status flags: autocommit
-        b"\xff\xff"                   # capability flags high
-        b"\x15"                       # auth-plugin-data length = 21
-        b"\x00" * 10                  # reserved
+        b"\x4a\x00\x00\x00\x0a"              # length=74, seq=0, proto=10
+        b"5.7.38-log\x00"                     # server version
+        b"\x01\x00\x00\x00"                   # connection id
+        b"\x3e\x4b\x7c\x21\x32\x5f\x62\x41\x00"  # auth-data part 1 + NUL
+        b"\xff\xf7"                            # capability flags low
+        b"\x21"                                # charset utf8
+        b"\x02\x00"                            # status: autocommit
+        b"\xff\xff"                            # capability flags high
+        b"\x15"                                # auth-plugin-data length=21
+        b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"  # reserved 10 bytes
         b"\x28\x60\x43\x5e\x72\x3a\x71\x42\x4e\x35\x37\x21\x00"  # auth-data part 2
         b"mysql_native_password\x00"
     )
 
     _ERR = (
-        b"\x31\x00\x00\x02"          # packet length, seq = 2
-        b"\xff"                       # ERR packet
-        b"\x15\x04"                   # error code 1045
-        b"#28000"                     # SQL state
+        b"\x31\x00\x00\x02"                   # packet length, seq=2
+        b"\xff\x15\x04"                        # ERR marker + error code 1045
+        b"#28000"                              # SQL state
         b"Access denied for user (using password: YES)"
     )
 

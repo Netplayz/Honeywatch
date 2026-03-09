@@ -23,8 +23,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 RestrictNamespaces=true
 RestrictRealtime=true
 ProtectKernelTunables=true
@@ -32,6 +32,9 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 LockPersonality=true
 ReadWritePaths=/var/lib/honeypot /var/log/honeypot
+
+[Install]
+WantedBy=multi-user.target
 
 [Install]
 WantedBy=multi-user.target

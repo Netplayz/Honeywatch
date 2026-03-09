@@ -10,7 +10,7 @@ Group=honeywatch
 WorkingDirectory=/opt/honeywatch
 Environment=PYTHONPATH=/opt/honeywatch
 ExecStart=/opt/honeywatch/venv/bin/python main.py
-Restart=on-failure
+Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal

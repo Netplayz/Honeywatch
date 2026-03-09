@@ -10,13 +10,10 @@ import threading
 
 import asyncssh
 
+# database is in the same directory; main.py puts ROOT on sys.path
+import database
+
 logger = logging.getLogger(__name__)
-
-
-def _db():
-    """Lazy import — breaks circular import at load time."""
-    import database  # noqa: PLC0415
-    return database
 
 
 # ── SSH honeypot ───────────────────────────────────────────────────────────────
@@ -31,7 +28,7 @@ async def start_ssh_honeypot(host: str = "0.0.0.0", port: int = 2222):
             self._conn = conn
             peer = conn.get_extra_info("peername") or ("unknown", 0)
             self._ip, self._port = peer[0], peer[1]
-            _db().log_event(
+            database.log_event(
                 src_ip=self._ip, src_port=self._port,
                 service="SSH", event_type="connection",
                 payload=None, username=None, password=None,
@@ -40,20 +37,20 @@ async def start_ssh_honeypot(host: str = "0.0.0.0", port: int = 2222):
 
         def begin_auth(self, username):
             self._username = username
-            return True
+            return True  # always require authentication
 
         def password_auth_requested(self):
             return True
 
         def validate_password(self, username, password):
-            _db().log_event(
+            database.log_event(
                 src_ip=self._ip, src_port=self._port,
                 service="SSH", event_type="auth_attempt",
                 payload=None, username=username, password=password,
             )
             logger.info("SSH auth from %s  user=%s  pass=%s",
                         self._ip, username, password)
-            return False
+            return False  # always deny
 
         def public_key_auth_requested(self):
             return False
@@ -71,7 +68,7 @@ async def start_ssh_honeypot(host: str = "0.0.0.0", port: int = 2222):
     logger.info("SSH honeypot listening on %s:%s", host, port)
 
 
-# ── Base class ────────────────────────────────────────────────────────────────
+# ── Base class for thread-based honeypots ──────────────────────────────────────
 
 class _BaseHoneypot(threading.Thread):
     SERVICE = "unknown"
@@ -102,7 +99,7 @@ class _BaseHoneypot(threading.Thread):
         raise NotImplementedError
 
 
-# ── HTTP ──────────────────────────────────────────────────────────────────────
+# ── HTTP honeypot ──────────────────────────────────────────────────────────────
 
 class HTTPHoneypot(_BaseHoneypot):
     SERVICE = "HTTP"
@@ -112,7 +109,8 @@ class HTTPHoneypot(_BaseHoneypot):
         b"HTTP/1.1 200 OK\r\n"
         b"Server: Apache/2.4.41 (Ubuntu)\r\n"
         b"Content-Type: text/html; charset=utf-8\r\n"
-        b"Connection: close\r\n\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
         b"<!DOCTYPE html><html><head><title>Admin Login</title></head>"
         b"<body><h2>Admin Panel</h2>"
         b"<form method='POST' action='/login'>"
@@ -126,10 +124,12 @@ class HTTPHoneypot(_BaseHoneypot):
         ip, port = addr
         try:
             raw = conn.recv(4096).decode(errors="replace")
+            # Parse request line
             first_line = raw.split("\r\n", 1)[0]
             parts = first_line.split(" ")
             method = parts[0] if len(parts) > 0 else ""
             path = parts[1] if len(parts) > 1 else "/"
+            # Parse POST body for credentials
             body = raw.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in raw else ""
             username = password = None
             if body:
@@ -139,9 +139,11 @@ class HTTPHoneypot(_BaseHoneypot):
                 m = re.search(r"(?:^|&)password=([^&]*)", body)
                 if m:
                     password = m.group(1)
-            _db().log_event(
-                src_ip=ip, src_port=port, service="HTTP", event_type="request",
-                payload=f"{method} {path}", username=username, password=password,
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="HTTP", event_type="request",
+                payload=f"{method} {path}",
+                username=username, password=password,
             )
             conn.sendall(self._RESPONSE)
         except Exception as exc:
@@ -150,7 +152,7 @@ class HTTPHoneypot(_BaseHoneypot):
             conn.close()
 
 
-# ── Telnet ────────────────────────────────────────────────────────────────────
+# ── Telnet honeypot ────────────────────────────────────────────────────────────
 
 class TelnetHoneypot(_BaseHoneypot):
     SERVICE = "Telnet"
@@ -163,8 +165,9 @@ class TelnetHoneypot(_BaseHoneypot):
             username = conn.recv(256).decode(errors="replace").strip()
             conn.sendall(b"Password: ")
             password = conn.recv(256).decode(errors="replace").strip()
-            _db().log_event(
-                src_ip=ip, src_port=port, service="Telnet", event_type="auth_attempt",
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="Telnet", event_type="auth_attempt",
                 payload=None, username=username, password=password,
             )
             conn.sendall(b"\r\nLogin incorrect\r\n")
@@ -174,7 +177,7 @@ class TelnetHoneypot(_BaseHoneypot):
             conn.close()
 
 
-# ── FTP ───────────────────────────────────────────────────────────────────────
+# ── FTP honeypot ───────────────────────────────────────────────────────────────
 
 class FTPHoneypot(_BaseHoneypot):
     SERVICE = "FTP"
@@ -195,10 +198,10 @@ class FTPHoneypot(_BaseHoneypot):
                     conn.sendall(b"331 Password required.\r\n")
                 elif upper.startswith("PASS "):
                     password = line[5:].strip()
-                    _db().log_event(
-                        src_ip=ip, src_port=port, service="FTP",
-                        event_type="auth_attempt", payload=None,
-                        username=username, password=password,
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="FTP", event_type="auth_attempt",
+                        payload=None, username=username, password=password,
                     )
                     conn.sendall(b"530 Login incorrect.\r\n")
                     break
@@ -209,278 +212,5 @@ class FTPHoneypot(_BaseHoneypot):
                     conn.sendall(b"500 Unknown command.\r\n")
         except Exception as exc:
             logger.debug("FTP handler error from %s: %s", ip, exc)
-        finally:
-            conn.close()
-
-
-# ── SMTP ──────────────────────────────────────────────────────────────────────
-
-class SMTPHoneypot(_BaseHoneypot):
-    SERVICE = "SMTP"
-    DEFAULT_PORT = 2525
-
-    def _handle(self, conn: socket.socket, addr: tuple):
-        ip, port = addr
-        username = password = mail_from = rcpt_to = None
-        payload_lines = []
-        try:
-            conn.sendall(b"220 mail.corp-internal.local ESMTP Postfix\r\n")
-            for _ in range(50):
-                line = conn.recv(1024).decode(errors="replace").strip()
-                if not line:
-                    break
-                upper = line.upper()
-                if upper.startswith("EHLO") or upper.startswith("HELO"):
-                    payload_lines.append(line)
-                    conn.sendall(
-                        b"250-mail.corp-internal.local\r\n"
-                        b"250-SIZE 10240000\r\n"
-                        b"250-AUTH LOGIN PLAIN\r\n"
-                        b"250 OK\r\n"
-                    )
-                elif upper.startswith("AUTH LOGIN"):
-                    conn.sendall(b"334 VXNlcm5hbWU6\r\n")
-                    import base64
-                    u_b64 = conn.recv(256).decode(errors="replace").strip()
-                    try:
-                        username = base64.b64decode(u_b64).decode(errors="replace")
-                    except Exception:
-                        username = u_b64
-                    conn.sendall(b"334 UGFzc3dvcmQ6\r\n")
-                    p_b64 = conn.recv(256).decode(errors="replace").strip()
-                    try:
-                        password = base64.b64decode(p_b64).decode(errors="replace")
-                    except Exception:
-                        password = p_b64
-                    _db().log_event(
-                        src_ip=ip, src_port=port, service="SMTP",
-                        event_type="auth_attempt",
-                        payload=" ".join(payload_lines) or None,
-                        username=username, password=password,
-                    )
-                    conn.sendall(b"535 5.7.8 Authentication credentials invalid\r\n")
-                    break
-                elif upper.startswith("MAIL FROM"):
-                    mail_from = line
-                    conn.sendall(b"250 OK\r\n")
-                elif upper.startswith("RCPT TO"):
-                    rcpt_to = line
-                    conn.sendall(b"250 OK\r\n")
-                elif upper == "DATA":
-                    conn.sendall(b"354 End data with <CR><LF>.<CR><LF>\r\n")
-                    body = conn.recv(8192).decode(errors="replace")
-                    _db().log_event(
-                        src_ip=ip, src_port=port, service="SMTP",
-                        event_type="mail_data",
-                        payload=f"{mail_from} -> {rcpt_to}\n{body[:500]}",
-                        username=None, password=None,
-                    )
-                    conn.sendall(b"550 5.1.1 User unknown\r\n")
-                    break
-                elif upper == "QUIT":
-                    conn.sendall(b"221 Bye\r\n")
-                    break
-                else:
-                    conn.sendall(b"502 Command not implemented\r\n")
-        except Exception as exc:
-            logger.debug("SMTP handler error from %s: %s", ip, exc)
-        finally:
-            conn.close()
-
-
-# ── RDP ───────────────────────────────────────────────────────────────────────
-
-class RDPHoneypot(_BaseHoneypot):
-    SERVICE = "RDP"
-    DEFAULT_PORT = 3389
-
-    _CC_PDU = bytes([
-        0x03, 0x00, 0x00, 0x13,
-        0x0e, 0xd0,
-        0x00, 0x00, 0x00, 0x00, 0x00,
-        0x02, 0x00, 0x08, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    ])
-
-    def _handle(self, conn: socket.socket, addr: tuple):
-        ip, port = addr
-        try:
-            data = conn.recv(1024)
-            username = None
-            try:
-                text = data.decode(errors="replace")
-                import re as _re
-                m = _re.search(r"mstshash=([^\r\n]+)", text)
-                if m:
-                    username = m.group(1).strip()
-            except Exception:
-                pass
-            _db().log_event(
-                src_ip=ip, src_port=port, service="RDP", event_type="connection",
-                payload=data.hex()[:200], username=username, password=None,
-            )
-            conn.sendall(self._CC_PDU)
-            try:
-                conn.settimeout(3)
-                extra = conn.recv(2048)
-                if extra:
-                    _db().log_event(
-                        src_ip=ip, src_port=port, service="RDP",
-                        event_type="negotiation", payload=extra.hex()[:200],
-                        username=None, password=None,
-                    )
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.debug("RDP handler error from %s: %s", ip, exc)
-        finally:
-            conn.close()
-
-
-# ── MySQL ─────────────────────────────────────────────────────────────────────
-
-class MySQLHoneypot(_BaseHoneypot):
-    SERVICE = "MySQL"
-    DEFAULT_PORT = 3306
-
-    _GREETING = (
-        b"\x4a\x00\x00\x00\x0a"
-        b"5.7.38-log\x00"
-        b"\x01\x00\x00\x00"
-        b"\x3e\x4b\x7c\x21\x32\x5f\x62\x41\x00"
-        b"\xff\xf7\x21\x02\x00\xff\xff\x15"
-        b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-        b"\x28\x60\x43\x5e\x72\x3a\x71\x42\x4e\x35\x37\x21\x00"
-        b"mysql_native_password\x00"
-    )
-
-    _ERR = (
-        b"\x31\x00\x00\x02\xff\x15\x04"
-        b"#28000"
-        b"Access denied for user (using password: YES)"
-    )
-
-    def _handle(self, conn: socket.socket, addr: tuple):
-        ip, port = addr
-        try:
-            conn.sendall(self._GREETING)
-            data = conn.recv(4096)
-            username = password_hash = None
-            try:
-                payload = data[4:]
-                null_idx = payload.index(b"\x00", 32)
-                username = payload[32:null_idx].decode(errors="replace")
-                hash_len = payload[null_idx + 1]
-                password_hash = payload[null_idx + 2: null_idx + 2 + hash_len].hex()
-            except Exception:
-                pass
-            _db().log_event(
-                src_ip=ip, src_port=port, service="MySQL", event_type="auth_attempt",
-                payload=None, username=username, password=password_hash,
-            )
-            conn.sendall(self._ERR)
-        except Exception as exc:
-            logger.debug("MySQL handler error from %s: %s", ip, exc)
-        finally:
-            conn.close()
-
-
-# ── Redis ─────────────────────────────────────────────────────────────────────
-
-class RedisHoneypot(_BaseHoneypot):
-    SERVICE = "Redis"
-    DEFAULT_PORT = 6379
-
-    def _handle(self, conn: socket.socket, addr: tuple):
-        ip, port = addr
-        try:
-            conn.settimeout(10)
-            for _ in range(30):
-                data = conn.recv(1024).decode(errors="replace").strip()
-                if not data:
-                    break
-                upper = data.upper()
-                if "AUTH" in upper:
-                    parts = data.split()
-                    password = parts[-1] if len(parts) >= 2 else data
-                    _db().log_event(
-                        src_ip=ip, src_port=port, service="Redis",
-                        event_type="auth_attempt", payload=data[:200],
-                        username=None, password=password,
-                    )
-                    conn.sendall(b"-ERR invalid password\r\n")
-                    break
-                elif any(cmd in upper for cmd in ("INFO", "CONFIG", "KEYS", "DBSIZE")):
-                    _db().log_event(
-                        src_ip=ip, src_port=port, service="Redis",
-                        event_type="command", payload=data[:200],
-                        username=None, password=None,
-                    )
-                    conn.sendall(b"-NOAUTH Authentication required\r\n")
-                elif upper.startswith("PING"):
-                    conn.sendall(b"+PONG\r\n")
-                else:
-                    _db().log_event(
-                        src_ip=ip, src_port=port, service="Redis",
-                        event_type="command", payload=data[:200],
-                        username=None, password=None,
-                    )
-                    conn.sendall(b"-NOAUTH Authentication required\r\n")
-        except Exception as exc:
-            logger.debug("Redis handler error from %s: %s", ip, exc)
-        finally:
-            conn.close()
-
-
-# ── SMB ───────────────────────────────────────────────────────────────────────
-
-class SMBHoneypot(_BaseHoneypot):
-    SERVICE = "SMB"
-    DEFAULT_PORT = 445
-
-    _NEG_RESP = bytes.fromhex(
-        "000000900000000000000000"
-        "fe534d42"
-        "40000000" "00000000" "00000000"
-        "0100" "0000"
-        "00000000" "0000000000000000"
-        "fffe0000" "01000000"
-        "41000100" "02020000"
-        + "00" * 100
-    )
-
-    def _handle(self, conn: socket.socket, addr: tuple):
-        ip, port = addr
-        try:
-            data = conn.recv(4096)
-            if not data:
-                return
-            _db().log_event(
-                src_ip=ip, src_port=port, service="SMB", event_type="negotiate",
-                payload=data.hex()[:300], username=None, password=None,
-            )
-            try:
-                conn.sendall(self._NEG_RESP)
-                conn.settimeout(5)
-                session_data = conn.recv(4096)
-                if session_data:
-                    username = None
-                    try:
-                        text = session_data.decode("utf-16-le", errors="ignore")
-                        import re as _re
-                        m = _re.search(r"([A-Za-z0-9\-_]{2,30})", text)
-                        if m:
-                            username = m.group(1)
-                    except Exception:
-                        pass
-                    _db().log_event(
-                        src_ip=ip, src_port=port, service="SMB",
-                        event_type="session_setup", payload=session_data.hex()[:300],
-                        username=username, password=None,
-                    )
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.debug("SMB handler error from %s: %s", ip, exc)
         finally:
             conn.close()

@@ -1,222 +1,543 @@
 """
-HoneyWatch - Web dashboard
-Flask app with Server-Sent Events for real-time updates.
-Served on port 5000 by default.
+HoneyWatch - Honeypot services
+SSH, HTTP, Telnet and FTP traps that log every connection attempt.
 """
 
-import json
 import logging
-import os
-import queue
-import sys
-import csv
-import io
+import re
+import socket
 import threading
-from datetime import datetime, timezone
-from pathlib import Path
-from functools import wraps
 
-from flask import Flask, Response, jsonify, request
+import asyncssh
 
-# Ensure the project root is on sys.path so database.py is importable
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
+# database is in the same directory; main.py puts ROOT on sys.path
 import database
 
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("DASHBOARD_SECRET", "honeywatch-change-me")
 
-# ── Optional HTTP basic auth ───────────────────────────────────────────────────
+# ── SSH honeypot ───────────────────────────────────────────────────────────────
 
-_DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "")
-_DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
+async def start_ssh_honeypot(host: str = "0.0.0.0", port: int = 2222):
+    """Start a fake SSH server that logs every auth attempt."""
 
+    host_key = asyncssh.generate_private_key("ssh-rsa")
 
-def _auth_required(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not _DASHBOARD_USER:
-            return f(*args, **kwargs)
-        auth = request.authorization
-        if (
-            not auth
-            or auth.username != _DASHBOARD_USER
-            or auth.password != _DASHBOARD_PASS
-        ):
-            return Response(
-                "Authentication required.",
-                401,
-                {"WWW-Authenticate": 'Basic realm="HoneyWatch"'},
+    class _Server(asyncssh.SSHServer):
+        def connection_made(self, conn):
+            self._conn = conn
+            peer = conn.get_extra_info("peername") or ("unknown", 0)
+            self._ip, self._port = peer[0], peer[1]
+            database.log_event(
+                src_ip=self._ip, src_port=self._port,
+                service="SSH", event_type="connection",
+                payload=None, username=None, password=None,
             )
-        return f(*args, **kwargs)
-    return wrapper
+            logger.info("SSH connection from %s:%s", self._ip, self._port)
+
+        def begin_auth(self, username):
+            self._username = username
+            return True  # always require authentication
+
+        def password_auth_requested(self):
+            return True
+
+        def validate_password(self, username, password):
+            database.log_event(
+                src_ip=self._ip, src_port=self._port,
+                service="SSH", event_type="auth_attempt",
+                payload=None, username=username, password=password,
+            )
+            logger.info("SSH auth from %s  user=%s  pass=%s",
+                        self._ip, username, password)
+            return False  # always deny
+
+        def public_key_auth_requested(self):
+            return False
+
+    async def _noop(process):
+        pass
+
+    await asyncssh.create_server(
+        _Server,
+        host=host,
+        port=port,
+        server_host_keys=[host_key],
+        process_factory=_noop,
+    )
+    logger.info("SSH honeypot listening on %s:%s", host, port)
 
 
-# ── Server-Sent Events broadcaster ────────────────────────────────────────────
+# ── Base class for thread-based honeypots ──────────────────────────────────────
 
-_sse_clients: list = []
-_sse_lock = threading.Lock()
+class _BaseHoneypot(threading.Thread):
+    SERVICE = "unknown"
+    DEFAULT_PORT = 9999
 
+    def __init__(self, host: str = "0.0.0.0", port: int = None):
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port if port is not None else self.DEFAULT_PORT
 
-def _broadcast(data: dict):
-    message = "data: " + json.dumps(data) + "\n\n"
-    with _sse_lock:
-        stale = []
-        for q in _sse_clients:
-            try:
-                q.put_nowait(message)
-            except queue.Full:
-                stale.append(q)
-        for q in stale:
-            _sse_clients.remove(q)
-
-
-# Patch database.log_event so new events are pushed to SSE clients live
-_original_log_event = database.log_event
-
-
-def _patched_log_event(src_ip, src_port, service, event_type,
-                       payload, username, password):
-    _original_log_event(src_ip, src_port, service, event_type,
-                        payload, username, password)
-    _broadcast({
-        "src_ip": src_ip,
-        "service": service,
-        "event_type": event_type,
-    })
-
-
-database.log_event = _patched_log_event
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
-
-@app.route("/")
-@_auth_required
-def index():
-    html_path = Path(__file__).resolve().parent / "index.html"
-    return html_path.read_text(encoding="utf-8")
-
-
-@app.route("/api/stats")
-@_auth_required
-def api_stats():
-    return jsonify(database.get_stats())
-
-
-@app.route("/api/events")
-@_auth_required
-def api_events():
-    limit = min(int(request.args.get("limit", 100)), 1000)
-    return jsonify(database.get_recent_events(limit))
-
-
-@app.route("/api/stream")
-@_auth_required
-def api_stream():
-    """Server-Sent Events endpoint — pushes live events to the browser."""
-    client_q: queue.Queue = queue.Queue(maxsize=100)
-    with _sse_lock:
-        _sse_clients.append(client_q)
-
-    def generate():
-        try:
-            yield "retry: 3000\n\n"
+    def run(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self.host, self.port))
+            srv.listen(50)
+            logger.info("%s honeypot listening on %s:%s",
+                        self.SERVICE, self.host, self.port)
             while True:
                 try:
-                    yield client_q.get(timeout=25)
-                except queue.Empty:
-                    yield ": keepalive\n\n"
-        except GeneratorExit:
-            pass
+                    conn, addr = srv.accept()
+                    threading.Thread(
+                        target=self._handle, args=(conn, addr), daemon=True
+                    ).start()
+                except Exception as exc:
+                    logger.error("%s accept error: %s", self.SERVICE, exc)
+
+    def _handle(self, conn: socket.socket, addr: tuple):
+        raise NotImplementedError
+
+
+# ── HTTP honeypot ──────────────────────────────────────────────────────────────
+
+class HTTPHoneypot(_BaseHoneypot):
+    SERVICE = "HTTP"
+    DEFAULT_PORT = 8080
+
+    _RESPONSE = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Server: Apache/2.4.41 (Ubuntu)\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"<!DOCTYPE html><html><head><title>Admin Login</title></head>"
+        b"<body><h2>Admin Panel</h2>"
+        b"<form method='POST' action='/login'>"
+        b"<label>Username <input name='username'></label><br>"
+        b"<label>Password <input name='password' type='password'></label><br>"
+        b"<button type='submit'>Login</button>"
+        b"</form></body></html>"
+    )
+
+    def _handle(self, conn: socket.socket, addr: tuple):
+        ip, port = addr
+        try:
+            raw = conn.recv(4096).decode(errors="replace")
+            # Parse request line
+            first_line = raw.split("\r\n", 1)[0]
+            parts = first_line.split(" ")
+            method = parts[0] if len(parts) > 0 else ""
+            path = parts[1] if len(parts) > 1 else "/"
+            # Parse POST body for credentials
+            body = raw.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in raw else ""
+            username = password = None
+            if body:
+                m = re.search(r"(?:^|&)username=([^&]*)", body)
+                if m:
+                    username = m.group(1)
+                m = re.search(r"(?:^|&)password=([^&]*)", body)
+                if m:
+                    password = m.group(1)
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="HTTP", event_type="request",
+                payload=f"{method} {path}",
+                username=username, password=password,
+            )
+            conn.sendall(self._RESPONSE)
+        except Exception as exc:
+            logger.debug("HTTP handler error from %s: %s", ip, exc)
         finally:
-            with _sse_lock:
-                if client_q in _sse_clients:
-                    _sse_clients.remove(client_q)
+            conn.close()
 
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+
+# ── Telnet honeypot ────────────────────────────────────────────────────────────
+
+class TelnetHoneypot(_BaseHoneypot):
+    SERVICE = "Telnet"
+    DEFAULT_PORT = 2323
+
+    def _handle(self, conn: socket.socket, addr: tuple):
+        ip, port = addr
+        try:
+            conn.sendall(b"Ubuntu 24.04 LTS\r\nlogin: ")
+            username = conn.recv(256).decode(errors="replace").strip()
+            conn.sendall(b"Password: ")
+            password = conn.recv(256).decode(errors="replace").strip()
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="Telnet", event_type="auth_attempt",
+                payload=None, username=username, password=password,
+            )
+            conn.sendall(b"\r\nLogin incorrect\r\n")
+        except Exception as exc:
+            logger.debug("Telnet handler error from %s: %s", ip, exc)
+        finally:
+            conn.close()
+
+
+# ── FTP honeypot ───────────────────────────────────────────────────────────────
+
+class FTPHoneypot(_BaseHoneypot):
+    SERVICE = "FTP"
+    DEFAULT_PORT = 2121
+
+    def _handle(self, conn: socket.socket, addr: tuple):
+        ip, port = addr
+        username = None
+        try:
+            conn.sendall(b"220 ProFTPD 1.3.6 Server ready.\r\n")
+            for _ in range(20):
+                line = conn.recv(256).decode(errors="replace").strip()
+                if not line:
+                    break
+                upper = line.upper()
+                if upper.startswith("USER "):
+                    username = line[5:].strip()
+                    conn.sendall(b"331 Password required.\r\n")
+                elif upper.startswith("PASS "):
+                    password = line[5:].strip()
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="FTP", event_type="auth_attempt",
+                        payload=None, username=username, password=password,
+                    )
+                    conn.sendall(b"530 Login incorrect.\r\n")
+                    break
+                elif upper == "QUIT":
+                    conn.sendall(b"221 Goodbye.\r\n")
+                    break
+                else:
+                    conn.sendall(b"500 Unknown command.\r\n")
+        except Exception as exc:
+            logger.debug("FTP handler error from %s: %s", ip, exc)
+        finally:
+            conn.close()
+
+
+# ── SMTP honeypot ──────────────────────────────────────────────────────────────
+
+class SMTPHoneypot(_BaseHoneypot):
+    """Fake SMTP server — captures EHLO hostname, AUTH credentials, and mail data."""
+    SERVICE = "SMTP"
+    DEFAULT_PORT = 2525  # use 25 in prod (requires root); 587 for submission
+
+    def _handle(self, conn: socket.socket, addr: tuple):
+        ip, port = addr
+        username = password = mail_from = rcpt_to = None
+        payload_lines = []
+        try:
+            conn.sendall(b"220 mail.corp-internal.local ESMTP Postfix\r\n")
+            for _ in range(50):
+                line = conn.recv(1024).decode(errors="replace").strip()
+                if not line:
+                    break
+                upper = line.upper()
+                if upper.startswith("EHLO") or upper.startswith("HELO"):
+                    payload_lines.append(line)
+                    conn.sendall(
+                        b"250-mail.corp-internal.local\r\n"
+                        b"250-SIZE 10240000\r\n"
+                        b"250-AUTH LOGIN PLAIN\r\n"
+                        b"250 OK\r\n"
+                    )
+                elif upper.startswith("AUTH LOGIN"):
+                    conn.sendall(b"334 VXNlcm5hbWU6\r\n")  # "Username:"
+                    import base64
+                    u_b64 = conn.recv(256).decode(errors="replace").strip()
+                    try:
+                        username = base64.b64decode(u_b64).decode(errors="replace")
+                    except Exception:
+                        username = u_b64
+                    conn.sendall(b"334 UGFzc3dvcmQ6\r\n")  # "Password:"
+                    p_b64 = conn.recv(256).decode(errors="replace").strip()
+                    try:
+                        password = base64.b64decode(p_b64).decode(errors="replace")
+                    except Exception:
+                        password = p_b64
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="SMTP", event_type="auth_attempt",
+                        payload=" ".join(payload_lines) or None,
+                        username=username, password=password,
+                    )
+                    conn.sendall(b"535 5.7.8 Authentication credentials invalid\r\n")
+                    break
+                elif upper.startswith("MAIL FROM"):
+                    mail_from = line
+                    conn.sendall(b"250 OK\r\n")
+                elif upper.startswith("RCPT TO"):
+                    rcpt_to = line
+                    conn.sendall(b"250 OK\r\n")
+                elif upper == "DATA":
+                    conn.sendall(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                    body = conn.recv(8192).decode(errors="replace")
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="SMTP", event_type="mail_data",
+                        payload=f"{mail_from} -> {rcpt_to}\n{body[:500]}",
+                        username=None, password=None,
+                    )
+                    conn.sendall(b"550 5.1.1 User unknown\r\n")
+                    break
+                elif upper == "QUIT":
+                    conn.sendall(b"221 Bye\r\n")
+                    break
+                else:
+                    conn.sendall(b"502 Command not implemented\r\n")
+        except Exception as exc:
+            logger.debug("SMTP handler error from %s: %s", ip, exc)
+        finally:
+            conn.close()
+
+
+# ── RDP honeypot ───────────────────────────────────────────────────────────────
+
+class RDPHoneypot(_BaseHoneypot):
+    """
+    Fake RDP banner — logs every connection and records the initial
+    Client X.224 Connection Request PDU (contains the cookie / username).
+    """
+    SERVICE = "RDP"
+    DEFAULT_PORT = 3389
+
+    # Minimal X.224 Connection Confirm — tells the client to proceed in plain
+    # (not NLA/TLS), so scanners that check banners will keep sending data.
+    _CC_PDU = bytes([
+        0x03, 0x00, 0x00, 0x13,          # TPKT header (length 19)
+        0x0e,                             # TPDU length
+        0xd0,                             # X.224 CC
+        0x00, 0x00,                       # dst reference
+        0x00, 0x00,                       # src reference
+        0x00,                             # class / options
+        # RDP Negotiation Response — PROTOCOL_RDP (0)
+        0x02, 0x00, 0x08, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ])
+
+    def _handle(self, conn: socket.socket, addr: tuple):
+        ip, port = addr
+        try:
+            data = conn.recv(1024)
+            # RDP cookies look like "Cookie: mstshash=USERNAME\r\n"
+            username = None
+            try:
+                text = data.decode(errors="replace")
+                import re as _re
+                m = _re.search(r"mstshash=([^\r\n]+)", text)
+                if m:
+                    username = m.group(1).strip()
+            except Exception:
+                pass
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="RDP", event_type="connection",
+                payload=data.hex()[:200],
+                username=username, password=None,
+            )
+            conn.sendall(self._CC_PDU)
+            # Grab one more packet (CredSSP / NLA client hello) if it arrives
+            try:
+                conn.settimeout(3)
+                extra = conn.recv(2048)
+                if extra:
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="RDP", event_type="negotiation",
+                        payload=extra.hex()[:200],
+                        username=None, password=None,
+                    )
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("RDP handler error from %s: %s", ip, exc)
+        finally:
+            conn.close()
+
+
+# ── MySQL honeypot ─────────────────────────────────────────────────────────────
+
+class MySQLHoneypot(_BaseHoneypot):
+    """
+    Sends a real-looking MySQL 5.7 Server Greeting, then captures the
+    client's Login Request (contains username + hashed password).
+    """
+    SERVICE = "MySQL"
+    DEFAULT_PORT = 3306
+
+    # Hand-crafted MySQL Initial Handshake Packet (protocol v10)
+    _GREETING = (
+        b"\x4a\x00\x00\x00"          # packet length = 74, seq = 0
+        b"\x0a"                       # protocol version 10
+        b"5.7.38-log\x00"            # server version string
+        b"\x01\x00\x00\x00"          # connection id = 1
+        b"\x3e\x4b\x7c\x21\x32\x5f\x62\x41\x00"  # auth-plugin-data part 1 (8 bytes + NUL)
+        b"\xff\xf7"                   # capability flags low
+        b"\x21"                       # charset utf8
+        b"\x02\x00"                   # status flags: autocommit
+        b"\xff\xff"                   # capability flags high
+        b"\x15"                       # auth-plugin-data length = 21
+        b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"  # reserved (10 bytes)
+        b"\x28\x60\x43\x5e\x72\x3a\x71\x42\x4e\x35\x37\x21\x00"  # auth-data part 2
+        b"mysql_native_password\x00"
     )
 
-
-@app.route("/api/export")
-@_auth_required
-def api_export():
-    """
-    Export all honeypot events as CSV or JSON.
-
-    Query parameters:
-        format  — "csv" (default) or "json"
-        limit   — max rows to export (default 10000, max 100000)
-        service — filter by service name, e.g. ?service=SSH (optional)
-        since   — ISO-8601 timestamp lower bound, e.g. ?since=2024-01-01T00:00:00Z (optional)
-
-    Example:
-        GET /api/export?format=csv&service=SSH&since=2024-06-01T00:00:00Z
-    """
-    fmt     = request.args.get("format", "csv").lower()
-    limit   = min(int(request.args.get("limit", 10000)), 100_000)
-    service = request.args.get("service", "").strip()
-    since   = request.args.get("since", "").strip()
-
-    conn = database._get_conn()
-
-    sql    = "SELECT * FROM events WHERE 1=1"
-    params = []
-    if service:
-        sql    += " AND service = ?"
-        params.append(service)
-    if since:
-        sql    += " AND timestamp >= ?"
-        params.append(since)
-    sql += " ORDER BY timestamp DESC LIMIT ?"
-    params.append(limit)
-
-    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
-
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    if fmt == "json":
-        output = json.dumps(rows, indent=2, default=str)
-        return Response(
-            output,
-            mimetype="application/json",
-            headers={
-                "Content-Disposition": f"attachment; filename=honeywatch_export_{ts}.json",
-                "Content-Length": str(len(output.encode())),
-            },
-        )
-
-    # CSV (default)
-    si = io.StringIO()
-    if rows:
-        writer = csv.DictWriter(si, fieldnames=rows[0].keys(), lineterminator="\r\n")
-        writer.writeheader()
-        writer.writerows(rows)
-    else:
-        si.write("(no events matched the filter)\r\n")
-
-    output = si.getvalue()
-    return Response(
-        output,
-        mimetype="text/csv",
-        headers={
-            "Content-Disposition": f"attachment; filename=honeywatch_export_{ts}.csv",
-            "Content-Length": str(len(output.encode())),
-        },
+    _ERR = (
+        b"\x31\x00\x00\x02"          # packet length, seq = 2
+        b"\xff"                       # ERR packet
+        b"\x15\x04"                   # error code 1045
+        b"#28000"                     # SQL state
+        b"Access denied for user (using password: YES)"
     )
 
+    def _handle(self, conn: socket.socket, addr: tuple):
+        ip, port = addr
+        try:
+            conn.sendall(self._GREETING)
+            data = conn.recv(4096)
+            # MySQL Login Request: skip 4-byte header + 32-byte capabilities etc.
+            username = password_hash = None
+            try:
+                # After header (4) + capability (4) + max_packet (4) + charset (1)
+                # + reserved (23) = offset 36
+                payload = data[4:]
+                null_idx = payload.index(b"\x00", 32)
+                username = payload[32:null_idx].decode(errors="replace")
+                # Next byte is hash length
+                hash_len = payload[null_idx + 1]
+                password_hash = payload[null_idx + 2: null_idx + 2 + hash_len].hex()
+            except Exception:
+                pass
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="MySQL", event_type="auth_attempt",
+                payload=None,
+                username=username, password=password_hash,
+            )
+            conn.sendall(self._ERR)
+        except Exception as exc:
+            logger.debug("MySQL handler error from %s: %s", ip, exc)
+        finally:
+            conn.close()
 
-if __name__ == "__main__":
-    host = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
-    port = int(os.environ.get("DASHBOARD_PORT", "5000"))
-    app.run(host=host, port=port, threaded=True, debug=False)
+
+# ── Redis honeypot ─────────────────────────────────────────────────────────────
+
+class RedisHoneypot(_BaseHoneypot):
+    """
+    Mimics an unauthenticated Redis 7.x instance.
+    Logs AUTH attempts and any commands sent before disconnect.
+    """
+    SERVICE = "Redis"
+    DEFAULT_PORT = 6379
+
+    def _handle(self, conn: socket.socket, addr: tuple):
+        ip, port = addr
+        try:
+            conn.settimeout(10)
+            for _ in range(30):
+                data = conn.recv(1024).decode(errors="replace").strip()
+                if not data:
+                    break
+                upper = data.upper()
+                # RESP inline: AUTH <password>  or  *2\r\n$4\r\nAUTH\r\n...
+                if "AUTH" in upper:
+                    parts = data.split()
+                    password = parts[-1] if len(parts) >= 2 else data
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="Redis", event_type="auth_attempt",
+                        payload=data[:200],
+                        username=None, password=password,
+                    )
+                    conn.sendall(b"-ERR invalid password\r\n")
+                    break
+                elif any(cmd in upper for cmd in ("INFO", "CONFIG", "KEYS", "DBSIZE")):
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="Redis", event_type="command",
+                        payload=data[:200],
+                        username=None, password=None,
+                    )
+                    conn.sendall(b"-NOAUTH Authentication required\r\n")
+                elif upper.startswith("PING"):
+                    conn.sendall(b"+PONG\r\n")
+                else:
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="Redis", event_type="command",
+                        payload=data[:200],
+                        username=None, password=None,
+                    )
+                    conn.sendall(b"-NOAUTH Authentication required\r\n")
+        except Exception as exc:
+            logger.debug("Redis handler error from %s: %s", ip, exc)
+        finally:
+            conn.close()
+
+
+# ── SMB honeypot ───────────────────────────────────────────────────────────────
+
+class SMBHoneypot(_BaseHoneypot):
+    """
+    Responds to SMB NEGOTIATE with a minimal SMB2 Negotiate Response,
+    then captures the SMB2 SESSION_SETUP request containing the NTLMSSP
+    negotiate blob — includes workstation name, domain, and OS details.
+    """
+    SERVICE = "SMB"
+    DEFAULT_PORT = 445
+
+    # SMB2 Negotiate Response — dialect 0x0202 (SMB 2.0.2), no signing required
+    _NEG_RESP = bytes.fromhex(
+        "000000900000000000000000"         # NetBIOS session header (len=0x90)
+        "fe534d42"                         # SMB2 magic
+        "40000000" "00000000" "00000000"   # structure, credit, status, command(0=neg)
+        "0100" "0000"                      # credits, flags
+        "00000000" "0000000000000000"      # chain, msg-id
+        "fffe0000" "01000000"              # tree, session
+        # Negotiate response body (minimal)
+        "41000100" "02020000"              # structure size=65, dialect 0x0202
+        + "00" * 100                       # pad to size
+    )
+
+    def _handle(self, conn: socket.socket, addr: tuple):
+        ip, port = addr
+        try:
+            data = conn.recv(4096)
+            if not data:
+                return
+            # Log the raw negotiate — NTLMSSP info lives in the session setup packet
+            database.log_event(
+                src_ip=ip, src_port=port,
+                service="SMB", event_type="negotiate",
+                payload=data.hex()[:300],
+                username=None, password=None,
+            )
+            try:
+                conn.sendall(self._NEG_RESP)
+                conn.settimeout(5)
+                session_data = conn.recv(4096)
+                if session_data:
+                    # Extract workstation from NTLMSSP if present
+                    username = None
+                    try:
+                        text = session_data.decode("utf-16-le", errors="ignore")
+                        import re as _re
+                        m = _re.search(r"([A-Za-z0-9\-_]{2,30})", text)
+                        if m:
+                            username = m.group(1)
+                    except Exception:
+                        pass
+                    database.log_event(
+                        src_ip=ip, src_port=port,
+                        service="SMB", event_type="session_setup",
+                        payload=session_data.hex()[:300],
+                        username=username, password=None,
+                    )
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("SMB handler error from %s: %s", ip, exc)
+        finally:
+            conn.close()

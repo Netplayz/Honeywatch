@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HoneyWatch - Main entrypoint
-Starts SSH, HTTP, Telnet, FTP honeypots + web dashboard
+Starts SSH, HTTP, Telnet, FTP, SMTP, RDP, MySQL, Redis, SMB honeypots + web dashboard
 """
 
 import asyncio
@@ -30,7 +30,11 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 # ── Import services after path is set ─────────────────────────────────────────
-from services import HTTPHoneypot, TelnetHoneypot, FTPHoneypot, start_ssh_honeypot  # noqa: E402
+from services import (  # noqa: E402
+    HTTPHoneypot, TelnetHoneypot, FTPHoneypot,
+    SMTPHoneypot, RDPHoneypot, MySQLHoneypot, RedisHoneypot, SMBHoneypot,
+    start_ssh_honeypot,
+)
 
 
 def start_dashboard():
@@ -48,10 +52,16 @@ async def main():
     logger.info("=" * 50)
 
     # Start thread-based honeypots
+    # Each port can be overridden via environment variable.
     thread_services = [
-        (HTTPHoneypot, int(os.environ.get("HTTP_PORT", "8080"))),
+        (HTTPHoneypot,   int(os.environ.get("HTTP_PORT", "8080"))),
         (TelnetHoneypot, int(os.environ.get("TELNET_PORT", "2323"))),
-        (FTPHoneypot, int(os.environ.get("FTP_PORT", "2121"))),
+        (FTPHoneypot,    int(os.environ.get("FTP_PORT", "2121"))),
+        (SMTPHoneypot,   int(os.environ.get("SMTP_PORT", "2525"))),
+        (RDPHoneypot,    int(os.environ.get("RDP_PORT", "3389"))),
+        (MySQLHoneypot,  int(os.environ.get("MYSQL_PORT", "3306"))),
+        (RedisHoneypot,  int(os.environ.get("REDIS_PORT", "6379"))),
+        (SMBHoneypot,    int(os.environ.get("SMB_PORT", "445"))),
     ]
     for cls, port in thread_services:
         cls(port=port).start()

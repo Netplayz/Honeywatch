@@ -19,8 +19,6 @@ def _db():
     return database
 
 
-
-
 # ── SSH honeypot ───────────────────────────────────────────────────────────────
 
 async def start_ssh_honeypot(host: str = "0.0.0.0", port: int = 2222):

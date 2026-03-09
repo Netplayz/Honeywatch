@@ -167,7 +167,7 @@ setInterval(refresh,10000);
 @app.route("/")
 def index():
     return render_template_string(_HTML)
-    
+
 
 @app.route("/api/stats")
 def api_stats():

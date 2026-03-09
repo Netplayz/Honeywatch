@@ -9,7 +9,6 @@ import logging
 import os
 import sys
 import threading
-# Using Path for cross-platform compatibility
 from pathlib import Path
 
 # Always resolve imports relative to this file's directory
@@ -57,7 +56,6 @@ async def main():
     logger.info("=" * 50)
 
     # Start thread-based honeypots
-    # Collapsed extra spaces to satisfy Flake8 E241
     thread_services = [
         (HTTPHoneypot, int(os.environ.get("HTTP_PORT", "8080"))),
         (TelnetHoneypot, int(os.environ.get("TELNET_PORT", "2323"))),
@@ -79,8 +77,7 @@ async def main():
     # Start async SSH honeypot
     ssh_port = int(os.environ.get("SSH_PORT", "2222"))
     logger.info("All services running. Press Ctrl+C to stop.")
-    
-    # This call typically blocks the event loop until the server is closed
+
     await start_ssh_honeypot(port=ssh_port)
 
 

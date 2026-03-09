@@ -9,7 +9,10 @@ import logging
 import os
 import queue
 import sys
+import csv
+import io
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
 
@@ -141,6 +144,74 @@ def api_stream():
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/api/export")
+@_auth_required
+def api_export():
+    """
+    Export all honeypot events as CSV or JSON.
+
+    Query parameters:
+        format  — "csv" (default) or "json"
+        limit   — max rows to export (default 10000, max 100000)
+        service — filter by service name, e.g. ?service=SSH (optional)
+        since   — ISO-8601 timestamp lower bound, e.g. ?since=2024-01-01T00:00:00Z (optional)
+
+    Example:
+        GET /api/export?format=csv&service=SSH&since=2024-06-01T00:00:00Z
+    """
+    fmt     = request.args.get("format", "csv").lower()
+    limit   = min(int(request.args.get("limit", 10000)), 100_000)
+    service = request.args.get("service", "").strip()
+    since   = request.args.get("since", "").strip()
+
+    conn = database._get_conn()
+
+    sql    = "SELECT * FROM events WHERE 1=1"
+    params = []
+    if service:
+        sql    += " AND service = ?"
+        params.append(service)
+    if since:
+        sql    += " AND timestamp >= ?"
+        params.append(since)
+    sql += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+
+    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    if fmt == "json":
+        output = json.dumps(rows, indent=2, default=str)
+        return Response(
+            output,
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": f"attachment; filename=honeywatch_export_{ts}.json",
+                "Content-Length": str(len(output.encode())),
+            },
+        )
+
+    # CSV (default)
+    si = io.StringIO()
+    if rows:
+        writer = csv.DictWriter(si, fieldnames=rows[0].keys(), lineterminator="\r\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    else:
+        si.write("(no events matched the filter)\r\n")
+
+    output = si.getvalue()
+    return Response(
+        output,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=honeywatch_export_{ts}.csv",
+            "Content-Length": str(len(output.encode())),
         },
     )
 

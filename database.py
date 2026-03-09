@@ -295,16 +295,16 @@ def _send_weekly_email():
     if not host:
         return  # alerts not configured — skip silently
 
-    port      = int(os.environ.get("ALERT_SMTP_PORT", "587"))
-    user      = os.environ.get("ALERT_SMTP_USER", "")
-    password  = os.environ.get("ALERT_SMTP_PASS", "")
-    to_raw    = os.environ.get("ALERT_EMAIL_TO", user)
-    use_tls   = os.environ.get("ALERT_SMTP_TLS", "1") != "0"
+    port = int(os.environ.get("ALERT_SMTP_PORT", "587"))
+    user = os.environ.get("ALERT_SMTP_USER", "")
+    password = os.environ.get("ALERT_SMTP_PASS", "")
+    to_raw = os.environ.get("ALERT_EMAIL_TO", user)
+    use_tls = os.environ.get("ALERT_SMTP_TLS", "1") != "0"
     recipients = [a.strip() for a in to_raw.split(",") if a.strip()]
 
     try:
         stats = get_stats()
-        top_ips  = stats.get("top_ips",  [])[:5]
+        top_ips = stats.get("top_ips", [])[:5]
         top_pass = stats.get("top_passwords", [])[:5]
         top_svcs = stats.get("by_service", [])
 
@@ -337,13 +337,13 @@ Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
 — HoneyWatch (automated alert)
 """
 
-        html_rows_svc  = "".join(
+        html_rows_svc = "".join(
             f"<tr><td>{r['service']}</td><td>{r['cnt']}</td></tr>"
             for r in top_svcs
         )
-        html_rows_ip   = "".join(
+        html_rows_ip = "".join(
             f"<tr><td>{r['src_ip']}</td><td>{r['cnt']}</td>"
-            f"<td>{r.get('country','')}</td>"
+            f"<td>{r.get('country', '')}</td>"
             f"<td>{'⚠ Yes' if r.get('is_known_bad') else 'No'}</td></tr>"
             for r in top_ips
         )
@@ -368,10 +368,10 @@ Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
 <p style='color:#666'>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</p>
 
 <div>
-  <span class='stat'><strong>{stats.get('total',0)}</strong><br>All-time events</span>
-  <span class='stat'><strong>{stats.get('last_24h',0)}</strong><br>Last 24 h</span>
-  <span class='stat'><strong>{stats.get('last_hour',0)}</strong><br>Last hour</span>
-  <span class='stat'><strong>{stats.get('known_bad_count',0)}</strong><br>Known-bad IPs</span>
+  <span class='stat'><strong>{stats.get('total', 0)}</strong><br>All-time events</span>
+  <span class='stat'><strong>{stats.get('last_24h', 0)}</strong><br>Last 24 h</span>
+  <span class='stat'><strong>{stats.get('last_hour', 0)}</strong><br>Last hour</span>
+  <span class='stat'><strong>{stats.get('known_bad_count', 0)}</strong><br>Known-bad IPs</span>
 </div>
 
 <h2>Events by Service</h2>
@@ -393,9 +393,9 @@ Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
             f"{stats.get('last_24h', 0)} events in last 24 h"
         )
         msg["From"] = user
-        msg["To"]   = ", ".join(recipients)
+        msg["To"] = ", ".join(recipients)
         msg.attach(_mime_text.MIMEText(body_plain, "plain"))
-        msg.attach(_mime_text.MIMEText(body_html,  "html"))
+        msg.attach(_mime_text.MIMEText(body_html, "html"))
 
         with smtplib.SMTP(host, port, timeout=10) as server:
             if use_tls:

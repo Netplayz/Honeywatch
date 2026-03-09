@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import threading
+# Using Path for cross-platform compatibility
 from pathlib import Path
 
 # Always resolve imports relative to this file's directory
@@ -30,11 +31,15 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 # ── Import services after path is set ─────────────────────────────────────────
-from services import (  # noqa: E402
-    HTTPHoneypot, TelnetHoneypot, FTPHoneypot,
-    SMTPHoneypot, RDPHoneypot, MySQLHoneypot, RedisHoneypot, SMBHoneypot,
-    start_ssh_honeypot,
-)
+try:
+    from services import (  # noqa: E402
+        HTTPHoneypot, TelnetHoneypot, FTPHoneypot,
+        SMTPHoneypot, RDPHoneypot, MySQLHoneypot, RedisHoneypot, SMBHoneypot,
+        start_ssh_honeypot,
+    )
+except ImportError as e:
+    logger.error("Failed to import services: %s", e)
+    sys.exit(1)
 
 
 def start_dashboard():
@@ -52,33 +57,35 @@ async def main():
     logger.info("=" * 50)
 
     # Start thread-based honeypots
-    # Each port can be overridden via environment variable.
+    # Collapsed extra spaces to satisfy Flake8 E241
     thread_services = [
-        (HTTPHoneypot,   int(os.environ.get("HTTP_PORT", "8080"))),
+        (HTTPHoneypot, int(os.environ.get("HTTP_PORT", "8080"))),
         (TelnetHoneypot, int(os.environ.get("TELNET_PORT", "2323"))),
-        (FTPHoneypot,    int(os.environ.get("FTP_PORT", "2121"))),
-        (SMTPHoneypot,   int(os.environ.get("SMTP_PORT", "2525"))),
-        (RDPHoneypot,    int(os.environ.get("RDP_PORT", "3389"))),
-        (MySQLHoneypot,  int(os.environ.get("MYSQL_PORT", "3306"))),
-        (RedisHoneypot,  int(os.environ.get("REDIS_PORT", "6379"))),
-        (SMBHoneypot,    int(os.environ.get("SMB_PORT", "445"))),
+        (FTPHoneypot, int(os.environ.get("FTP_PORT", "2121"))),
+        (SMTPHoneypot, int(os.environ.get("SMTP_PORT", "2525"))),
+        (RDPHoneypot, int(os.environ.get("RDP_PORT", "3389"))),
+        (MySQLHoneypot, int(os.environ.get("MYSQL_PORT", "3306"))),
+        (RedisHoneypot, int(os.environ.get("REDIS_PORT", "6379"))),
+        (SMBHoneypot, int(os.environ.get("SMB_PORT", "445"))),
     ]
+
     for cls, port in thread_services:
+        logger.info("Starting %s on port %s", cls.__name__, port)
         cls(port=port).start()
 
     # Start dashboard in its own thread
     threading.Thread(target=start_dashboard, daemon=True).start()
 
-    # Start async SSH honeypot (blocks until cancelled)
+    # Start async SSH honeypot
     ssh_port = int(os.environ.get("SSH_PORT", "2222"))
-    await start_ssh_honeypot(port=ssh_port)
-
     logger.info("All services running. Press Ctrl+C to stop.")
-    await asyncio.Event().wait()
+    
+    # This call typically blocks the event loop until the server is closed
+    await start_ssh_honeypot(port=ssh_port)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Shutting down.")
+        logger.info("Shutdown signal received. Closing HoneyWatch.")

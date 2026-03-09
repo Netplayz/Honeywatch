@@ -39,6 +39,7 @@ A lightweight, production-ready honeypot for **Ubuntu 24.04 LTS** on DigitalOcea
 ```bash
 git clone https://github.com/netplayz/honeywatch.git
 cd honeywatch
+chmod +x ./update.sh
 sudo bash install.sh
 ```
 

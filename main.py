@@ -85,7 +85,6 @@ async def main():
 
     logger.info("All services running. Press Ctrl+C to stop.")
 
-    # 4. KEEP ALIVE 
     # This prevents the script from exiting and shutting down the service.
     # We use an Event to wait until the process is interrupted.
     stop_event = asyncio.Event()

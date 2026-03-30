@@ -175,4 +175,4 @@ Deploying a honeypot is legal in most jurisdictions when you own the server. You
 
 ## License
 
-MIT — do whatever you want, but please don't use it maliciously.
+GPL 3.0 — do whatever you want, but please don't use it maliciously.
